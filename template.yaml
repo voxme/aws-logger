@@ -1,0 +1,430 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Serverless log ingestion pipeline:
+  API Gateway -> Lambda -> SQS -> Lambda -> Kinesis Firehose -> Lambda -> CloudWatch Logs.
+  Deployed once per environment (Staging / Production) as an isolated stack.
+
+# ---------------------------------------------------------------------------
+# Parameters - everything that differs between environments is supplied here
+# via params/<env>.json. Nothing environment-specific is hard-coded below.
+# ---------------------------------------------------------------------------
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [staging, prod]
+    Description: Logical environment name. Drives the resource name suffix and tags.
+
+  ResourceSuffix:
+    Type: String
+    Description: Suffix appended to resource names, e.g. "Staging" or "Prod".
+
+  ApiStageName:
+    Type: String
+    Description: API Gateway stage name, e.g. "staging" or "prod".
+
+  ApiThrottleRateLimit:
+    Type: Number
+    Default: 1000
+    Description: Steady-state requests/sec allowed by the API stage.
+
+  ApiThrottleBurstLimit:
+    Type: Number
+    Default: 2000
+    Description: Burst capacity (bucket size) for the API stage.
+
+  CognitoUserPoolArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of the Cognito User Pool that protects POST /logging. Leave empty to
+      disable authorization (AuthorizationType NONE) - useful for testing.
+
+  CognitoAuthScopes:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Optional OAuth scopes required on the access token, e.g.
+      "logs/write". Leave empty to accept any valid token from the pool.
+
+  FirehoseBufferSeconds:
+    Type: Number
+    Default: 60
+    MinValue: 60
+    MaxValue: 900
+    Description: Firehose buffering hint in seconds.
+
+  FirehoseBufferMB:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 128
+    Description: Firehose buffering hint in MB.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: Retention (days) for the Lambda execution log groups.
+
+# ---------------------------------------------------------------------------
+Conditions:
+  # Enable Cognito only when a User Pool ARN is supplied for this environment.
+  UseCognito: !Not [!Equals [!Ref CognitoUserPoolArn, ""]]
+  # Apply scope checking only when scopes are supplied.
+  UseAuthScopes: !Not [!Equals [!Join ["", !Ref CognitoAuthScopes], ""]]
+
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ===========================================================================
+  # 3. SQS - buffering / decoupling layer
+  # ===========================================================================
+  IngestDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "LogIngestQueue-${ResourceSuffix}-DLQ"
+      MessageRetentionPeriod: 1209600 # 14 days
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+
+  IngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "LogIngestQueue-${ResourceSuffix}"
+      VisibilityTimeout: 90 # >= 6x consumer Lambda timeout
+      MessageRetentionPeriod: 345600 # 4 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IngestDLQ.Arn
+        maxReceiveCount: 5
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ===========================================================================
+  # S3 - Firehose delivery backstop (raw archive of every record)
+  # ===========================================================================
+  FirehoseBackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "log-ingest-firehose-${Environment}-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-raw-archive
+            Status: Enabled
+            ExpirationInDays: 14
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ===========================================================================
+  # 2. Lambda #1 - API Gateway handler (ingress: validate -> SQS)
+  # ===========================================================================
+  ApiHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "LogIngest-ApiHandler-${ResourceSuffix}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: send-to-queue
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [sqs:SendMessage]
+                Resource: !GetAtt IngestQueue.Arn
+
+  ApiHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "LogIngestLambda-${ResourceSuffix}"
+      Runtime: python3.12
+      Handler: app.lambda_handler
+      Timeout: 10
+      MemorySize: 256
+      Role: !GetAtt ApiHandlerRole.Arn
+      Code: ./src/api_handler
+      Environment:
+        Variables:
+          ENV: !Ref Environment
+          SQS_URL: !Ref IngestQueue
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+
+  ApiHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/LogIngestLambda-${ResourceSuffix}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ===========================================================================
+  # 1. API Gateway (REST, Regional) - exposes POST /logging
+  # ===========================================================================
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "LogIngestApi-${ResourceSuffix}"
+      EndpointConfiguration: { Types: [REGIONAL] }
+
+  LoggingResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: logging
+
+  # Cognito authorizer - created only when a User Pool ARN is provided.
+  ApiAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Condition: UseCognito
+    Properties:
+      Name: !Sub "LogIngestCognito-${ResourceSuffix}"
+      RestApiId: !Ref RestApi
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !Ref CognitoUserPoolArn
+
+  LoggingMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref LoggingResource
+      HttpMethod: POST
+      AuthorizationType: !If [UseCognito, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [UseCognito, !Ref ApiAuthorizer, !Ref "AWS::NoValue"]
+      AuthorizationScopes:
+        !If [UseAuthScopes, !Ref CognitoAuthScopes, !Ref "AWS::NoValue"]
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiHandlerFunction.Arn}/invocations"
+
+  ApiHandlerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/POST/logging"
+
+  # Logical ID is versioned (…V2) so updating the method/authorizer forces a
+  # fresh deployment snapshot; bump the suffix again on future API changes.
+  ApiDeploymentV2:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: LoggingMethod
+    Properties:
+      RestApiId: !Ref RestApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeploymentV2
+      StageName: !Ref ApiStageName
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: !Ref ApiThrottleRateLimit
+          ThrottlingBurstLimit: !Ref ApiThrottleBurstLimit
+          MetricsEnabled: true
+
+  # ===========================================================================
+  # 4. Lambda #2 - SQS consumer (SQS -> Firehose batches)
+  # ===========================================================================
+  SqsConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "LogIngest-SqsConsumer-${ResourceSuffix}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: consume-and-forward
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  [
+                    sqs:ReceiveMessage,
+                    sqs:DeleteMessage,
+                    sqs:GetQueueAttributes,
+                  ]
+                Resource: !GetAtt IngestQueue.Arn
+              - Effect: Allow
+                Action: [firehose:PutRecord, firehose:PutRecordBatch]
+                Resource: !GetAtt DeliveryStream.Arn
+
+  SqsConsumerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "LogIngest-SqsConsumer-${ResourceSuffix}"
+      Runtime: python3.12
+      Handler: app.lambda_handler
+      Timeout: 15
+      MemorySize: 256
+      Role: !GetAtt SqsConsumerRole.Arn
+      Code: ./src/sqs_consumer
+      Environment:
+        Variables:
+          ENV: !Ref Environment
+          FIREHOSE_STREAM: !Ref DeliveryStream
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+
+  SqsConsumerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/LogIngest-SqsConsumer-${ResourceSuffix}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  SqsConsumerEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt IngestQueue.Arn
+      FunctionName: !Ref SqsConsumerFunction
+      BatchSize: 10
+      FunctionResponseTypes: [ReportBatchItemFailures]
+
+  # ===========================================================================
+  # 6. Lambda #3 - Firehose processor (records -> CloudWatch Logs)
+  # ===========================================================================
+  FirehoseProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "LogIngest-FirehoseProc-${ResourceSuffix}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: write-target-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  [
+                    logs:CreateLogGroup,
+                    logs:CreateLogStream,
+                    logs:PutLogEvents,
+                    logs:DescribeLogStreams,
+                  ]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/LogApi/*"
+
+  FirehoseProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "LogIngest-FirehoseProc-${ResourceSuffix}"
+      Runtime: python3.12
+      Handler: app.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt FirehoseProcessorRole.Arn
+      Code: ./src/firehose_processor
+      Environment:
+        Variables:
+          ENV: !Ref Environment
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+
+  FirehoseProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/LogIngest-FirehoseProc-${ResourceSuffix}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ===========================================================================
+  # 5. Kinesis Firehose - batching / retries (S3 backstop + Lambda processor)
+  # ===========================================================================
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "LogIngest-Firehose-${ResourceSuffix}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: firehose.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: firehose-delivery
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  [
+                    s3:AbortMultipartUpload,
+                    s3:GetBucketLocation,
+                    s3:GetObject,
+                    s3:ListBucket,
+                    s3:ListBucketMultipartUploads,
+                    s3:PutObject,
+                  ]
+                Resource:
+                  - !GetAtt FirehoseBackupBucket.Arn
+                  - !Sub "${FirehoseBackupBucket.Arn}/*"
+              - Effect: Allow
+                Action: [lambda:InvokeFunction, lambda:GetFunctionConfiguration]
+                Resource: !GetAtt FirehoseProcessorFunction.Arn
+
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub "PUT-CloudWatch-${ResourceSuffix}"
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt FirehoseBackupBucket.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+        Prefix: "raw/"
+        ErrorOutputPrefix: "errors/"
+        CompressionFormat: GZIP
+        BufferingHints:
+          IntervalInSeconds: !Ref FirehoseBufferSeconds
+          SizeInMBs: !Ref FirehoseBufferMB
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt FirehoseProcessorFunction.Arn
+
+# ---------------------------------------------------------------------------
+Outputs:
+  ApiEndpoint:
+    Description: Public POST /logging endpoint for this environment.
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/logging"
+  QueueUrl:
+    Description: SQS ingest queue URL.
+    Value: !Ref IngestQueue
+  FirehoseStreamName:
+    Description: Kinesis Firehose delivery stream name.
+    Value: !Ref DeliveryStream
+  FirehoseBackupBucketName:
+    Description: S3 bucket holding the raw Firehose archive.
+    Value: !Ref FirehoseBackupBucket

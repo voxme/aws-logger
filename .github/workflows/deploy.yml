@@ -1,0 +1,116 @@
+name: deploy
+
+# Staging  -> push to develop
+# Prod     -> push to main or a v* tag
+# Manual   -> workflow_dispatch with environment choice
+on:
+  push:
+    branches: [develop, main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy
+        required: true
+        type: choice
+        options: [staging, prod]
+
+permissions:
+  id-token: write # required for OIDC role assumption
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  STACK_PREFIX: log-ingest
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Decide which environment this run targets.
+  # ---------------------------------------------------------------------------
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.pick.outputs.environment }}
+    steps:
+      - id: pick
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "environment=${{ inputs.environment }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+            echo "environment=staging" >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=prod" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Lint / validate the template on every run.
+  # ---------------------------------------------------------------------------
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install cfn-lint
+      - run: cfn-lint template.yaml
+
+  # ---------------------------------------------------------------------------
+  # Package + deploy to the resolved environment.
+  # ---------------------------------------------------------------------------
+  deploy:
+    needs: [resolve, validate]
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select environment configuration
+        id: cfg
+        run: |
+          if [ "${{ needs.resolve.outputs.environment }}" = "prod" ]; then
+            echo "role_arn=${{ secrets.AWS_ROLE_ARN_PROD }}" >> "$GITHUB_OUTPUT"
+            echo "artifact_bucket=${{ secrets.ARTIFACT_BUCKET_PROD }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "role_arn=${{ secrets.AWS_ROLE_ARN_STAGING }}" >> "$GITHUB_OUTPUT"
+            echo "artifact_bucket=${{ secrets.ARTIFACT_BUCKET_STAGING }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.cfg.outputs.role_arn }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Package
+        run: |
+          aws cloudformation package \
+            --template-file template.yaml \
+            --s3-bucket "${{ steps.cfg.outputs.artifact_bucket }}" \
+            --output-template-file packaged.yaml \
+            --region "$AWS_REGION"
+
+      - name: Build parameter overrides
+        id: params
+        run: |
+          ENV="${{ needs.resolve.outputs.environment }}"
+          OVERRIDES=$(jq -r '.[] | "\(.ParameterKey)=\(.ParameterValue)"' "params/$ENV.json" | tr '\n' ' ')
+          echo "overrides=$OVERRIDES" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy
+        run: |
+          ENV="${{ needs.resolve.outputs.environment }}"
+          aws cloudformation deploy \
+            --template-file packaged.yaml \
+            --stack-name "$STACK_PREFIX-$ENV" \
+            --parameter-overrides ${{ steps.params.outputs.overrides }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --region "$AWS_REGION"
+
+      - name: Show outputs
+        run: |
+          ENV="${{ needs.resolve.outputs.environment }}"
+          aws cloudformation describe-stacks \
+            --stack-name "$STACK_PREFIX-$ENV" \
+            --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs" --output table

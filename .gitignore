@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Packaging output
+packaged*.yaml
+*.zip
+build/
+dist/
+
+# AWS / local
+.aws-sam/
+samconfig.toml
+.env
+*.local.json
+
+# IDE
+.vs/
+.vscode/
+.idea/

@@ -1,0 +1,11 @@
+[
+  { "ParameterKey": "Environment", "ParameterValue": "prod" },
+  { "ParameterKey": "ResourceSuffix", "ParameterValue": "Prod" },
+  { "ParameterKey": "ApiStageName", "ParameterValue": "prod" },
+  { "ParameterKey": "ApiThrottleRateLimit", "ParameterValue": "1000" },
+  { "ParameterKey": "ApiThrottleBurstLimit", "ParameterValue": "2000" },
+  { "ParameterKey": "FirehoseBufferSeconds", "ParameterValue": "60" },
+  { "ParameterKey": "FirehoseBufferMB", "ParameterValue": "5" },
+  { "ParameterKey": "LogRetentionDays", "ParameterValue": "30" },
+  { "ParameterKey": "CognitoUserPoolArn", "ParameterValue": "arn:aws:cognito-idp:us-east-1:534556767837:userpool/us-east-1_cgoWRwKjm" }
+]
