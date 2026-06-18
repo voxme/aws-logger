@@ -17,11 +17,12 @@ Parameters:
 
   GitHubRefPattern:
     Type: String
-    Default: "repo:voxme/aws-logger:ref:refs/heads/develop"
+    Default: "repo:voxme/aws-logger:environment:staging"
     Description: >
-      OIDC subject (sub) pattern allowed to assume the role. Use a single ref
-      (e.g. refs/heads/develop) or a wildcard like
-      "repo:voxme/aws-logger:*" to allow any branch/tag.
+      OIDC subject (sub) pattern allowed to assume the role. Because the deploy
+      job targets a GitHub Environment, the sub is
+      "repo:ORG/REPO:environment:NAME". You may also use a wildcard like
+      "repo:voxme/aws-logger:*" to allow any subject.
 
   ArtifactBucketName:
     Type: String

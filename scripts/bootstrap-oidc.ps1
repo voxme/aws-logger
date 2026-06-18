@@ -41,7 +41,9 @@ $root = Split-Path -Parent $PSScriptRoot
 $template = Join-Path $root "bootstrap/github-oidc.yaml"
 $stackName = "gh-oidc-log-ingest-$Environment"
 $roleName = "gh-deploy-log-ingest-$Environment"
-$subPattern = "repo:$GitHubOrg/$GitHubRepo`:ref:refs/heads/$Branch"
+# The deploy job targets a GitHub Environment, so GitHub sets the OIDC token
+# `sub` to repo:ORG/REPO:environment:NAME (NOT ref:refs/heads/<branch>).
+$subPattern = "repo:$GitHubOrg/$GitHubRepo`:environment:$Environment"
 
 Write-Host "==> Ensuring artifact bucket s3://$ArtifactBucket exists ..." -ForegroundColor Cyan
 $exists = aws s3api head-bucket --bucket $ArtifactBucket --region $Region 2>$null
