@@ -1,11 +1,11 @@
 name: deploy
 
-# Staging  -> push to develop
+# Staging  -> push to staging
 # Prod     -> push to main or a v* tag
 # Manual   -> workflow_dispatch with environment choice
 on:
   push:
-    branches: [develop, main]
+    branches: [staging, main]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
@@ -36,7 +36,7 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "environment=${{ inputs.environment }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+          elif [ "${{ github.ref }}" = "refs/heads/staging" ]; then
             echo "environment=staging" >> "$GITHUB_OUTPUT"
           else
             echo "environment=prod" >> "$GITHUB_OUTPUT"
@@ -53,7 +53,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install cfn-lint
-      - run: cfn-lint template.yaml
+      # W3002: local Code/CodeUri paths are intentional - resolved by
+      # `aws cloudformation package` before deploy.
+      - run: cfn-lint template.yaml --ignore-checks W3002
 
   # ---------------------------------------------------------------------------
   # Package + deploy to the resolved environment.

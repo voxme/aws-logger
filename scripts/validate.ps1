@@ -26,7 +26,8 @@ Write-Host "    OK" -ForegroundColor Green
 
 if (Get-Command cfn-lint -ErrorAction SilentlyContinue) {
     Write-Host "==> cfn-lint ..." -ForegroundColor Cyan
-    cfn-lint $template
+    # W3002: local Code paths are intentional - resolved by `package`.
+    cfn-lint $template --ignore-checks W3002
     if ($LASTEXITCODE -ne 0) { throw "cfn-lint reported issues." }
     Write-Host "    OK" -ForegroundColor Green
 }

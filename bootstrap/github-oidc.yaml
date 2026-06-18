@@ -1,0 +1,145 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Bootstrap for GitHub Actions OIDC deploys. Creates (optionally) the GitHub
+  OIDC identity provider and an IAM role that a specific repo/branch can assume
+  to deploy the log-ingest stack. Deploy this ONCE per AWS account.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Default: voxme
+    Description: GitHub organization / user that owns the repository.
+
+  GitHubRepo:
+    Type: String
+    Default: aws-logger
+    Description: Repository name.
+
+  GitHubRefPattern:
+    Type: String
+    Default: "repo:voxme/aws-logger:ref:refs/heads/develop"
+    Description: >
+      OIDC subject (sub) pattern allowed to assume the role. Use a single ref
+      (e.g. refs/heads/develop) or a wildcard like
+      "repo:voxme/aws-logger:*" to allow any branch/tag.
+
+  ArtifactBucketName:
+    Type: String
+    Description: Name of the S3 bucket used for `cloudformation package` artifacts.
+
+  CreateOidcProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: >
+      Set to "false" if the GitHub OIDC provider already exists in this account
+      (only one provider per account is allowed).
+
+  RoleName:
+    Type: String
+    Default: gh-deploy-log-ingest-staging
+    Description: Name of the IAM role GitHub Actions will assume.
+
+Conditions:
+  ShouldCreateProvider: !Equals [!Ref CreateOidcProvider, "true"]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      # GitHub's OIDC thumbprint is validated by IAM automatically for this
+      # well-known provider; this value is the documented root thumbprint.
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+              StringLike:
+                "token.actions.githubusercontent.com:sub": !Ref GitHubRefPattern
+      Policies:
+        - PolicyName: deploy-log-ingest
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # CloudFormation stack operations.
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ValidateTemplate
+                Resource: "*"
+              # Upload packaged Lambda artifacts.
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::${ArtifactBucketName}"
+                  - !Sub "arn:aws:s3:::${ArtifactBucketName}/*"
+              # Resources the stack manages.
+              - Effect: Allow
+                Action:
+                  - lambda:*
+                  - sqs:*
+                  - firehose:*
+                  - apigateway:*
+                  - logs:*
+                  - s3:CreateBucket
+                  - s3:PutBucketTagging
+                  - s3:PutEncryptionConfiguration
+                  - s3:PutLifecycleConfiguration
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:GetEncryptionConfiguration
+                  - s3:GetLifecycleConfiguration
+                  - s3:GetBucketPublicAccessBlock
+                Resource: "*"
+              # Manage the per-resource IAM roles the stack creates.
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:TagRole
+                  - iam:UntagRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/LogIngest-*"
+
+Outputs:
+  RoleArn:
+    Description: ARN to store as the AWS_ROLE_ARN_STAGING GitHub secret.
+    Value: !GetAtt DeployRole.Arn
