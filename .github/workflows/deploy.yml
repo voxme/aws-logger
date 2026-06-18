@@ -1,12 +1,10 @@
 name: deploy
 
 # Staging  -> push to staging
-# Prod     -> push to main or a v* tag
-# Manual   -> workflow_dispatch with environment choice
+# Prod     -> manual only (workflow_dispatch with environment: prod)
 on:
   push:
-    branches: [staging, main]
-    tags: ["v*"]
+    branches: [staging]
   workflow_dispatch:
     inputs:
       environment:
