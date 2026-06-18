@@ -43,10 +43,14 @@ aws-logger/
 │   ├── api_handler/app.py        # Lambda #1 – validates + pushes to SQS
 │   ├── sqs_consumer/app.py       # Lambda #2 – SQS -> Firehose batches
 │   └── firehose_processor/app.py # Lambda #3 – Firehose -> CloudWatch Logs
+├── bootstrap/
+│   └── github-oidc.yaml          # One-time: GitHub OIDC provider + deploy role
 ├── scripts/
 │   ├── deploy.ps1                # package + deploy one environment
-│   └── validate.ps1              # cfn-lint / validate-template
-└── .github/workflows/deploy.yml  # CI/CD: staging on develop, prod on main/tag
+│   ├── validate.ps1              # cfn-lint / validate-template
+│   ├── bootstrap-oidc.ps1        # one-time OIDC role setup per environment
+│   └── get-token.ps1             # fetch a Cognito token for smoke-testing
+└── .github/workflows/deploy.yml  # CI/CD: staging on staging branch, prod on main/tag
 ```
 
 ## Prerequisites
@@ -73,7 +77,7 @@ the matching `params/<env>.json`.
 
 | Branch / event        | Environment deployed |
 | --------------------- | -------------------- |
-| push to `develop`     | Staging              |
+| push to `staging`     | Staging              |
 | push to `main` or tag | Production           |
 | manual dispatch       | choose `staging`/`prod` |
 
@@ -81,6 +85,40 @@ Configure these repository secrets:
 
 - `AWS_ROLE_ARN_STAGING`, `AWS_ROLE_ARN_PROD` – OIDC roles to assume.
 - `ARTIFACT_BUCKET_STAGING`, `ARTIFACT_BUCKET_PROD` – packaging buckets.
+
+### One-time OIDC bootstrap
+
+GitHub Actions authenticates to AWS with **keyless OIDC** (no long-lived
+access keys). Run `bootstrap-oidc.ps1` once per environment to create the IAM
+deploy role and (optionally) set the repository secrets:
+
+```powershell
+# Staging — creates the account-level GitHub OIDC provider on first run.
+./scripts/bootstrap-oidc.ps1 `
+  -Environment staging `
+  -ArtifactBucket my-cfn-artifacts-staging `
+  -GitHubOrg <org> -GitHubRepo <repo> `
+  -SetSecrets
+
+# Production — the OIDC provider already exists, so skip creating it.
+./scripts/bootstrap-oidc.ps1 `
+  -Environment prod `
+  -ArtifactBucket my-cfn-artifacts-prod `
+  -GitHubOrg <org> -GitHubRepo <repo> `
+  -CreateProvider:$false -SetSecrets
+```
+
+Notes:
+
+- Only **one** GitHub OIDC provider may exist per AWS account. The staging
+  stack owns it; pass `-CreateProvider:$false` on every other run (including
+  re-running prod) so it isn't duplicated or deleted.
+- The role's trust policy is scoped to the **GitHub Environment** subject
+  (`repo:<org>/<repo>:environment:<env>`), because the deploy job targets a
+  GitHub Environment — not a branch ref.
+- `-SetSecrets` uses the `gh` CLI to set `AWS_ROLE_ARN_<ENV>` and
+  `ARTIFACT_BUCKET_<ENV>`. Without `gh`, the script prints the values to set
+  manually in **Settings → Secrets and variables → Actions**.
 
 ## Sending a log
 
@@ -119,15 +157,39 @@ Get a token for smoke-testing with the helper script (USER_PASSWORD_AUTH must be
 enabled on the app client):
 
 ```powershell
+# Public app client (no client secret):
 $token = ./scripts/get-token.ps1 `
   -ClientId <app-client-id> `
   -Username <user> `
   -Password <password>
 
+# App client configured WITH a client secret — pass -ClientSecret and the
+# SECRET_HASH is computed automatically:
+$token = ./scripts/get-token.ps1 `
+  -ClientId <app-client-id> `
+  -Username <user> `
+  -Password <password> `
+  -ClientSecret <app-client-secret>
+
 Invoke-RestMethod -Method Post -Uri $endpoint `
   -Headers @{ Authorization = $token } `
   -ContentType "application/json" -Body $body
 ```
+
+`get-token.ps1` parameters:
+
+| Parameter        | Required | Default     | Purpose |
+| ---------------- | -------- | ----------- | --------------------------------------------- |
+| `-ClientId`      | yes      | —           | Cognito app client ID. |
+| `-Username`      | yes      | —           | Cognito username. |
+| `-Password`      | yes      | —           | User password. |
+| `-ClientSecret`  | no       | —           | Required for app clients that have a secret; used to compute `SECRET_HASH`. |
+| `-TokenType`     | no       | `Id`        | `Id` (default, for `COGNITO_USER_POOLS`) or `Access` (for scope checks). |
+| `-Region`        | no       | `us-east-1` | AWS region of the user pool. |
+
+By default the **Id** token is returned (what a `COGNITO_USER_POOLS` authorizer
+expects). Pass `-TokenType Access` if your authorizer validates access-token
+scopes.
 
 Optional fine-grained access: set `CognitoAuthScopes` (e.g. `logs/write`) in the
 parameter file to require specific OAuth scopes on the access token.
