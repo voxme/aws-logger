@@ -78,8 +78,10 @@ the matching `params/<env>.json`.
 | Branch / event        | Environment deployed |
 | --------------------- | -------------------- |
 | push to `staging`     | Staging              |
-| push to `main` or tag | Production           |
 | manual dispatch       | choose `staging`/`prod` |
+
+Production deploys are **manual only** — there is no automatic trigger. Use
+**Actions → deploy → Run workflow** and select `prod`.
 
 Configure these repository secrets:
 
